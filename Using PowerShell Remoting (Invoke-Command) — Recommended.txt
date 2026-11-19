@@ -1,0 +1,8 @@
+$computers = Get-Content "C:\path\to\computers.txt"
+$sharePath = "\\MasterPC\ExeReports"
+
+Invoke-Command -ComputerName $computers -ScriptBlock {
+    param($destination)
+    $outputFile = "$destination\$env:COMPUTERNAME-exe_list.txt"
+    cmd.exe /c "(echo === Computer: %COMPUTERNAME% === & echo === IP Addresses === & ipconfig | findstr /i /c:""IPv4 Address"" & echo ==================== & for %d in (C D E) do @if exist %d:\ (dir ""%d:\*.exe"" /s /b 2>nul)) > ""$outputFile"""
+} -ArgumentList $sharePath

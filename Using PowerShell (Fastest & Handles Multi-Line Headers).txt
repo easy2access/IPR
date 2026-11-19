@@ -1,0 +1,40 @@
+$reportsFolder = "C:\ExeReports"
+$outputCsv = "C:\ExeReports\Consolidated_Exe_Inventory.csv"
+
+$results = foreach ($file in Get-ChildItem -Path $reportsFolder -Filter "*.txt") {
+    $lines = Get-Content -Path $file.FullName
+    
+    $computer = ""
+    $ipList = @()
+    $parsingExes = $false
+
+    foreach ($line in $lines) {
+        $trimmed = $line.Trim()
+
+        # Extract Computer Name
+        if ($trimmed -match '^=== Computer:\s*(.*?)\s*===$') {
+            $computer = $matches[1]
+        }
+        # Extract IP Addresses
+        elseif ($trimmed -match 'IPv4 Address[.\s]*:\s*([0-9.]+)') {
+            $ipList += $matches[1]
+        }
+        # Detect the end of the header section
+        elseif ($trimmed -match '^={10,}$') {
+            $parsingExes = $true
+        }
+        # Capture file paths once past the header
+        elseif ($parsingExes -and $trimmed -ne "") {
+            [PSCustomObject]@{
+                ComputerName = $computer
+                IPAddress    = ($ipList -join '; ')
+                Drive        = $trimmed.Substring(0, 2)
+                FilePath     = $trimmed
+                FileName     = [System.IO.Path]::GetFileName($trimmed)
+            }
+        }
+    }
+}
+
+$results | Export-Csv -Path $outputCsv -NoTypeInformation -Encoding UTF8
+Write-Host "Consolidation complete: $outputCsv" -ForegroundColor Green

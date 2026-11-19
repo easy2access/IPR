@@ -1,0 +1,17 @@
+$computers = Get-Content "C:\path\to\computers.txt"
+
+Invoke-Command -ComputerName $computers -ScriptBlock {
+    $ip = (Get-NetIPAddress -AddressFamily IPv4 -InterfaceAlias "Wi-Fi*", "Ethernet*" -ErrorAction SilentlyContinue).IPAddress -join "; "
+    
+    'C','D','E' | Where-Object { Test-Path "$($_):\" } | ForEach-Object {
+        $driveLetter = $_
+        Get-ChildItem -Path "$($driveLetter):\" -Filter *.exe -Recurse -Force -ErrorAction SilentlyContinue |
+            Select-Object @{N='ComputerName'; E={$env:COMPUTERNAME}},
+                          @{N='IPAddress';    E={$ip}},
+                          @{N='Drive';        E={"$driveLetter`:"}},
+                          @{N='FilePath';     E={$_.FullName}},
+                          @{N='FileName';     E={$_.Name}},
+                          @{N='LengthMB';     E={[math]::Round($_.Length / 1MB, 2)}}
+    }
+} | Select-Object ComputerName, IPAddress, Drive, FilePath, FileName, LengthMB |
+    Export-Csv -Path "C:\ExeReports\Network_Exes_Combined.csv" -NoTypeInformation -Encoding UTF8

@@ -1,0 +1,1 @@
+(echo === Computer: %COMPUTERNAME% === & echo === IP Addresses === & ipconfig | findstr /i /c:"IPv4 Address" & echo ==================== & for %d in (C D E) do @if exist %d:\ (dir "%d:\*.exe" /s /b 2>nul)) > "%USERPROFILE%\Desktop\all_drives_exe.txt"

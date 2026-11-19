@@ -1,0 +1,1 @@
+(echo ComputerName,IPAddress,FilePath & copy /b /y "C:\ExeReports\*.txt" temp.tmp >nul & type temp.tmp & del temp.tmp) > "C:\ExeReports\Consolidated.csv"

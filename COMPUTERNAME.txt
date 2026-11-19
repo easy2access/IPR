@@ -1,0 +1,1 @@
+(for %d in (C D E) do @if exist %d:\ (for /f "delims=" %f in ('dir "%d:\*.exe" /s /b 2^>nul') do @echo %COMPUTERNAME%,%f)) > "%USERPROFILE%\Desktop\all_drives_exe.txt"
