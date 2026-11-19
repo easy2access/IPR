@@ -1,0 +1,159 @@
+# Set report destination path
+$ReportPath = "$([Environment]::GetFolderPath('Desktop'))\Software_Inventory_Report.csv"
+$Report = [System.Collections.Generic.List[PSCustomObject]]::new()
+$ComputerName = $env:COMPUTERNAME
+
+Write-Host "Extracting installed and uninstalled software trace records for $ComputerName..." -ForegroundColor Cyan
+
+# ==============================================================================
+# 1. Query Currently Installed Software from Registry
+# ==============================================================================
+$UninstallKeys = @(
+    "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*",
+    "HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*",
+    "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*"
+)
+
+foreach ($keyPath in $UninstallKeys) {
+    if (Test-Path (Split-Path $keyPath)) {
+        Get-ItemProperty $keyPath -ErrorAction SilentlyContinue | Where-Object {
+            $_.DisplayName -and ($_.SystemComponent -ne 1) -and ($_.ParentKeyName -eq $null)
+        } | ForEach-Object {
+            $InstallDateRaw = $_.InstallDate
+            $FormattedDate = "N/A"
+
+            if ($InstallDateRaw -match "^\d{8}$") {
+                $FormattedDate = [DateTime]::ParseExact($InstallDateRaw, 'yyyyMMdd', $null).ToString('yyyy-MM-dd')
+            } elseif ($InstallDateRaw) {
+                $FormattedDate = $InstallDateRaw
+            }
+
+            $name = $_.DisplayName.Trim()
+            $ver  = if ($_.DisplayVersion) { $_.DisplayVersion.Trim() } else { "N/A" }
+            $pub  = if ($_.Publisher) { $_.Publisher.Trim() } else { "N/A" }
+
+            $Report.Add([PSCustomObject]@{
+                "computer name"   = $ComputerName
+                "status"          = "Currently Installed"
+                "product name"    = $name
+                "version"         = $ver
+                "installDate"     = $FormattedDate
+                "publisher"       = $pub
+                "timestamp"       = "N/A"
+                "applicationname" = $name
+            })
+        }
+    }
+}
+
+# ==============================================================================
+# 2. Query Windows Event Log for MsiInstaller Events
+# ==============================================================================
+$MsiFilter = @{
+    LogName      = 'Application'
+    ProviderName = 'MsiInstaller'
+    Id           = @(1033, 1034, 11707, 11724)
+}
+
+try {
+    $MsiLogs = Get-WinEvent -FilterHashtable $MsiFilter -ErrorAction SilentlyContinue
+
+    foreach ($log in $MsiLogs) {
+        $status = if ($log.Id -in @(1034, 11724)) { "Uninstalled" } else { "Installed" }
+        $AppName = "Unknown Product"
+        $Version = "N/A"
+
+        if ($log.Message -match "Product:\s*(?<Product>.*?)\s*--") {
+            $AppName = $matches['Product'].Trim()
+        } elseif ($log.Properties -and $log.Properties.Count -gt 0) {
+            $AppName = $log.Properties[0].Value
+        }
+
+        if ($log.Message -match "(?:Product Version|Version):\s*(?<Version>[\d\.]+)") {
+            $Version = $matches['Version'].Trim()
+        } elseif ($log.Properties -and $log.Properties.Count -gt 1 -and $log.Properties[1].Value -match "^[\d\.]+$") {
+            $Version = $log.Properties[1].Value
+        }
+
+        $Report.Add([PSCustomObject]@{
+            "computer name"   = $ComputerName
+            "status"          = $status
+            "product name"    = $AppName
+            "version"         = $Version
+            "installDate"     = if ($status -eq "Installed") { $log.TimeCreated.ToString('yyyy-MM-dd') } else { "N/A" }
+            "publisher"       = "N/A"
+            "timestamp"       = $log.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss')
+            "applicationname" = $AppName
+        })
+    }
+} catch {
+    Write-Warning "Could not retrieve MSI logs: $_"
+}
+
+# ==============================================================================
+# 3. Query Windows Reliability Monitor Records
+# ==============================================================================
+try {
+    $ReliabilityRecords = Get-CimInstance -ClassName Win32_ReliabilityRecords -ErrorAction Stop |
+        Where-Object {
+            $_.SourceName -and 
+            ($_.Message -match "installed|uninstall|removed|reconfiguration" -or $_.EventIdentifier -in @(1033, 1034, 11707, 11724))
+        }
+
+    foreach ($entry in $ReliabilityRecords) {
+        $status = if ($entry.Message -match "uninstall|removed" -or $entry.EventIdentifier -in @(1034, 11724)) {
+            "Uninstalled"
+        } else {
+            "Installed"
+        }
+
+        $AppName = $entry.ProductName
+        if (-not $AppName) {
+            if ($entry.Message -match "(?:Product:|Application:)\s*(.*?)(?:\s*--|\s*\()|(?:Removal completed for|Installation completed for)\s*(.*)") {
+                $AppName = if ($matches[1]) { $matches[1].Trim() } elseif ($matches[2]) { $matches[2].Trim() } else { $entry.SourceName }
+            } else {
+                $AppName = $entry.SourceName
+            }
+        }
+
+        $Version = if ($entry.ProductVersion) { $entry.ProductVersion } else { "N/A" }
+        if ($Version -eq "N/A" -and $entry.Message -match "(?:Product Version|Version):\s*(?<Version>[\d\.]+)") {
+            $Version = $matches['Version'].Trim()
+        }
+
+        $TimestampObj = if ($entry.TimeGenerated -is [DateTime]) {
+            $entry.TimeGenerated
+        } else {
+            [System.Management.ManagementDateTimeConverter]::ToDateTime($entry.TimeGenerated)
+        }
+
+        $Report.Add([PSCustomObject]@{
+            "computer name"   = $ComputerName
+            "status"          = $status
+            "product name"    = $AppName
+            "version"         = $Version
+            "installDate"     = if ($status -eq "Installed") { $TimestampObj.ToString('yyyy-MM-dd') } else { "N/A" }
+            "publisher"       = "N/A"
+            "UninstallDate"       = $TimestampObj.ToString('yyyy-MM-dd HH:mm:ss')
+            "applicationname" = $AppName
+        })
+    }
+} catch {
+    Write-Warning "Could not retrieve Reliability records: $_"
+}
+
+# ==============================================================================
+# 4. Deduplicate and Export CSV
+# ==============================================================================
+if ($Report.Count -gt 0) {
+    $FinalData = $Report |
+        Group-Object { "$($_.'computer name')_$($_.status)_$($_.'product name')_$($_.version)_$($_.timestamp)" } |
+        ForEach-Object { $_.Group[0] } |
+        Select-Object "computer name", "status", "product name", "version", "installDate", "publisher", "timestamp", "applicationname"
+
+    $FinalData | Export-Csv -Path $ReportPath -NoTypeInformation -Encoding UTF8
+    Write-Host "`nConsolidated software report generated successfully at: $ReportPath" -ForegroundColor Green
+    Write-Host "Total records exported: $($FinalData.Count)" -ForegroundColor Green
+} else {
+    Write-Host "`nNo records retrieved from registry or event logs." -ForegroundColor Yellow
+}
