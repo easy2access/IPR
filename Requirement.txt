@@ -1,0 +1,6 @@
+Requirements
+PowerShell Remoting (WinRM) must be enabled on remote PCs (Enable-PSRemoting -Force).
+
+Domain Administrator rights or local administrator access on the target machines.
+
+Firewall must allow WinRM ports (HTTP: 5985 / HTTPS: 5986).
