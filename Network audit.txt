@@ -1,0 +1,112 @@
+
+As written, no—the script runs only against the local machine where it is executed. It queries the local registry, local event logs, and local filesystem (C:\Windows\Prefetch, C:\Program Files, etc.).
+
+However, you can adapt it to query computers across a network using PowerShell Remoting (Invoke-Command) or CIM/WMI (Get-CimInstance).
+
+Prerequisites for Network Execution
+Domain or Local Admin Rights: The account running the command must have administrative privileges on the target machines.
+
+WinRM Enabled: Windows Remote Management must be enabled on remote systems (enabled by default on Windows Server; on Windows 10/11 clients, run Enable-PSRemoting -Force as Admin).
+
+Firewall Access: Port 5985 (HTTP) or 5986 (HTTPS) must be open across the network.
+
+Remote Execution Script (Multi-Computer Audit)
+This version uses Invoke-Command to run the uninstallation trace collection across multiple computers in parallel and aggregates the results into a single CSV on your management workstation.
+
+Enable-PSRemoting -Force
+
+
+# 1. Define target endpoints
+# You can supply an array of computer names, an Active Directory query, or an IP list
+$ComputerNames = @("PC-ACCOUNTS01", "PC-SALES02", "192.168.1.50")
+
+# 2. Output path on the local admin machine
+$LocalExportPath = "$([Environment]::GetFolderPath('Desktop'))\Network_UninstallerTraces_Report.csv"
+
+Write-Host "Initiating remote trace audit across $(($ComputerNames).Count) endpoint(s)..." -ForegroundColor Cyan
+
+# 3. Execute concurrently across target systems
+$RemoteResults = Invoke-Command -ComputerName $ComputerNames -ErrorAction SilentlyContinue -ScriptBlock {
+    $HostName = $env:COMPUTERNAME
+    $FoundTraces = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+    # Query Reliability Records
+    try {
+        $RelRecords = Get-CimInstance -ClassName Win32_ReliabilityRecords -ErrorAction Stop |
+            Where-Object { 
+                $_.SourceName -and 
+                ($_.Message -match "uninstall|removed|reconfiguration" -or $_.EventIdentifier -in @(1034, 11724))
+            }
+
+        foreach ($rec in $RelRecords) {
+            $AppName = $rec.ProductName
+            if (-not $AppName) {
+                if ($rec.Message -match "(?:Product:|Application:)\s*(.*?)(?:\s*--|\s*\()|(?:Removal completed for\s*)(.*)") {
+                    $AppName = ($matches[1], $matches[2] -ne $null)[0].Trim()
+                } else {
+                    $AppName = $rec.SourceName
+                }
+            }
+
+            $FoundTraces.Add([PSCustomObject]@{
+                ComputerName   = $HostName
+                Timestamp      = [System.Management.ManagementDateTimeConverter]::ToDateTime($rec.TimeGenerated)
+                AppNameOrTrace = $AppName
+                TraceType      = "Reliability Record"
+                Details        = $rec.Message.Trim()
+            })
+        }
+    } catch {}
+
+    # Query MSI Event Log (IDs 1034 & 11724)
+    try {
+        $Events = Get-WinEvent -FilterHashtable @{LogName='Application'; ProviderName='MsiInstaller'; Id=@(1034, 11724)} -ErrorAction SilentlyContinue
+        foreach ($evt in $Events) {
+            $AppName = "Unknown Application"
+            if ($evt.Message -match "Product:\s*(.*?)\s*--\s*Removal completed") {
+                $AppName = $matches[1].Trim()
+            } elseif ($evt.Properties.Count -gt 0) {
+                $AppName = $evt.Properties[0].Value
+            }
+
+            $FoundTraces.Add([PSCustomObject]@{
+                ComputerName   = $HostName
+                Timestamp      = $evt.TimeCreated
+                AppNameOrTrace = $AppName
+                TraceType      = "MSI Event Log"
+                Details        = $evt.Message.Replace("`r`n", " ").Trim()
+            })
+        }
+    } catch {}
+
+    # Query Prefetch uninstaller executions
+    $PrefetchPath = "$env:SystemRoot\Prefetch"
+    if (Test-Path $PrefetchPath) {
+        $PfFiles = Get-ChildItem -Path $PrefetchPath -Include @('*UNINS*.pf', '*UNINSTALL*.pf') -Recurse -ErrorAction SilentlyContinue
+        foreach ($pf in $PfFiles) {
+            $FoundTraces.Add([PSCustomObject]@{
+                ComputerName   = $HostName
+                Timestamp      = $pf.LastWriteTime
+                AppNameOrTrace = $pf.Name
+                TraceType      = "Prefetch Execution Trace"
+                Details        = "Executed binary trace: $($pf.FullName)"
+            })
+        }
+    }
+
+    return $FoundTraces
+}
+
+# 4. Filter and Export to Local CSV
+if ($RemoteResults.Count -gt 0) {
+    $RemoteResults | 
+        Select-Object ComputerName, Timestamp, AppNameOrTrace, TraceType, Details | 
+        Sort-Object Timestamp -Descending | 
+        Export-Csv -Path $LocalExportPath -NoTypeInformation -Encoding UTF8
+
+    Write-Host "`nNetwork audit complete! Results saved to: $LocalExportPath" -ForegroundColor Green
+} else {
+    Write-Host "`nNo traces retrieved. Verify network connectivity, WinRM status, and administrative permissions." -ForegroundColor Yellow
+}
+
+Verification: Run the script against 1 or 2 test computer names. Check Network_UninstallerTraces_Report.csv to confirm that the ComputerName column differentiates which workstation reported each trace.
