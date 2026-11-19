@@ -1,0 +1,115 @@
+
+PS C:\WINDOWS\system32> # Set report destination path
+>> $ReportPath = "$([Environment]::GetFolderPath('Desktop'))\Software_Install_Uninstall_Trace.csv"
+>> $Records = [System.Collections.Generic.List[PSCustomObject]]::new()
+>>
+>> Write-Host "Collecting software installation and uninstallation events..." -ForegroundColor Cyan
+>>
+>> # 1. Query Windows Application Event Log (MsiInstaller)
+>> # Event IDs:
+>> # 1033  = Product installed / configured
+>> # 11707 = Installation completed successfully
+>> # 1034  = Product uninstalled
+>> # 11724 = Removal / uninstallation completed successfully
+>> $MsiFilter = @{
+>>     LogName      = 'Application'
+>>     ProviderName = 'MsiInstaller'
+>>     Id           = @(1033, 1034, 11707, 11724)
+>> }
+>> try 
+>>     $MsiEvents = Get-WinEvent -FilterHashtable$MsiFilter -ErrorAction SilentlyContinue
+>>     foreach ($event in$MsiEvents) {
+>>         $Action = if ($event.Id -in @(1034, 11724)) { "Uninstalled" } else { "Installed" }
+>>         $AppName = "Unknown Product"
+>>         $Version = "N/A"
+>>
+>>         # Extract Product Name & Version via regex from Event Message
+>>         if ($event.Message -match "Product:\s*(?<Product>.*?)\s*--") {
+>>             $AppName =$matches['Product'].Trim()
+>>         } elseif ($event.Properties -and$event.Properties.Count -gt 0) {
+>>             $AppName =$event.Properties[0].Value
+>>         }
+>>
+>>         if ($event.Message -match "(?:Product Version|Version):\s*(?<Version>[\d\.]+)") {
+>>             $Version =$matches['Version'].Trim()
+>>         } elseif ($event.Properties -and$event.Properties.Count -gt 1 -and $event.Properties[1].Value -match "^[\d\.]+$") {
+>>             $Version =$event.Properties[1].Value
+>>         }
+>>
+>>         $Records.Add([PSCustomObject]@{
+>>             "DateTime"    = $event.TimeCreated
+>>             "Action"      = $Action
+>>             "ProductName" = $AppName
+>>             "Version"     = $Version
+>>             "Source"      = "Application Event Log (MSI)"
+>>         })
+>>     }
+>> } catch {
+>>     Write-Warning "Could not read MSI Application event logs: $_"
+>> }
+>>
+>> # 2. Query Windows Reliability Records (Covers both MSI and non-MSI setup traces)
+>> try {
+>>     $ReliabilityRecords = Get-CimInstance -ClassName Win32_ReliabilityRecords -ErrorAction SilentlyContinue |
+>>         Where-Object {
+>>             $_.SourceName -and
+>>             ($_.Message -match "installed\vert{}uninstall\vert{}removed" -or $_.EventIdentifier -in @(1033, 1034, 11707, 11724))
+>>         }
+>>
+>>     foreach ($entry in $ReliabilityRecords) {$Action = if ($entry.Message -match "uninstall\vert{}removed" -or $entry.EventIdentifier -in @(1034, 11724)) {
+>>             "Uninstalled"
+>>         } else {
+>>             "Installed"
+>>         }
+>>
+>>         # Determine Product Name
+>>         $AppName =$entry.ProductName
+>>         if (-not $AppName) {
+>>             if ($entry.Message -match "(?:Product:|Application:)\s*(.*?)(?:\s*--|\s*\()|(?:Removal completed for|Installation completed for)\s*(.*)") {
+>>                 $AppName = if ($matches[1]) { $matches[1].Trim() } elseif ($matches[2]) { $matches[2].Trim() } else {$entry.SourceName }
+>>             } else {
+>>                 $AppName =$entry.SourceName
+>>             }
+>>         }
+>>
+>>         # Determine Version
+>>         $Version = if ($entry.ProductVersion) {$entry.ProductVersion } else { "N/A" }
+>>         if ($Version -eq "N/A" -and $entry.Message -match "(?:Product Version|Version):\s*(?<Version>[\d\.]+)") {
+>>             $Version =$matches['Version'].Trim()
+>>         }
+>>
+>>         $Timestamp = if ($entry.TimeGenerated --is [DateTime]) {
+>>             $entry.TimeGeneratedTimeGenerated -
+>>         } else {
+>>             [System.Management.ManagementDateTimeConverter]::ToDateTime($entry.TimeGenerated)
+>>         }
+>>
+>>         $Records.Add([PSCustomObject]@{
+>>             "DateTime"    = $Timestamp
+>>             "Action"      = $Action
+>>             "ProductName" = $AppName
+>>             "Version"     = $Version
+>>             "Source"      = "Windows Reliability Monitor"
+>>         })
+>>     }
+>> } catch {
+>>     Write-Warning "Could not read Reliability Monitor records: $_"
+>> }
+>>
+>> # 3. Deduplicate and Export to CSV
+>> if ($Records.Count -gt 0) {
+>>     # Deduplicate entries that log across both Reliability Monitor and Event Logs
+>>     $UniqueData = $Records |
+>>         Sort-Object DateTime -Descending |
+>>         Group-Object { "$($_.ProductName)_$($_.Action)_$($_.DateTime.ToString('yyyyMMddHHmm'))" } |
+>>         ForEach-Object { $_.Group[0] } |
+>>         Select-Object DateTime, Action, ProductName, Version, Source
+>>
+>>     $UniqueData | Export-Csv -Path $ReportPath -NoTypeInformation -Encoding UTF8
+>>
+>>     Write-Host "`nTrace report successfully created at:" -ForegroundColor Green
+>>     Write-Host "$ReportPath" -ForegroundColor Yellow
+>>     Write-Host "Total recorded events: $($UniqueData.Count)" -ForegroundColor Green
+>> } else {
+>>     Write-Host "`nNo installation or uninstallation events found in system history." -ForegroundColor Yellow
+>> }
